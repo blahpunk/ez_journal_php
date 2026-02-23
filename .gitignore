@@ -17,10 +17,18 @@ secrets.*
 ################################
 *.log
 logs/
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-yarn.lock
+
+################################
+# Local runtime data
+################################
+.data/
+.logs/
+*.sqlite
+*.sqlite3
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
 
 ################################
 # OS files
@@ -38,6 +46,12 @@ $RECYCLE.BIN/
 .idea/
 *.swp
 *.swo
+
+################################
+# PHP / Composer
+################################
+vendor/
+.phpunit.result.cache
 
 ################################
 # Python
@@ -66,6 +80,9 @@ node_modules/
 dist/
 build/
 coverage/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
 
 ################################
 # Generic build outputs
