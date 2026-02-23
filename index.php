@@ -4,9 +4,15 @@ declare(strict_types=1);
 // Configuration
 $databaseUrl = getenv('DATABASE_URL') ?: 'sqlite:////var/lib/ez_journal/journal.db';
 $secretKey = getenv('SECRET_KEY') ?: 'change-me';
-$adminPin = getenv('ADMIN_PIN') ?: '0000';
+$pinUserPin = getenv('PIN_USER_PIN') ?: '09111984';
 $logPath = getenv('LOG_PATH') ?: '/var/www/log/journal.log';
 $tz = new DateTimeZone('America/Chicago');
+$oauthLoginEndpoint = getenv('OAUTH_LOGIN_URL') ?: 'https://secure.blahpunk.com/oauth_login';
+$oauthLogoutEndpoint = getenv('OAUTH_LOGOUT_URL') ?: 'https://secure.blahpunk.com/logout';
+$secureAuthSecret = trim((string) (getenv('SECURE_AUTH_SECRET') ?: getenv('FLASK_SECRET_KEY') ?: ''));
+$adminEmail = strtolower(trim((string) (getenv('JOURNAL_ADMIN_EMAIL') ?: 'eric.zeigenbein@gmail.com')));
+$damianEmail = strtolower(trim((string) (getenv('JOURNAL_DAMIAN_EMAIL') ?: 'ionru404@gmail.com')));
+$pinUserLabel = trim((string) (getenv('JOURNAL_PIN_LABEL') ?: 'J.'));
 
 // Secure session cookie settings
 $https = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off')
@@ -48,7 +54,152 @@ function db_connect(string $databaseUrl): PDO
     return $pdo;
 }
 
-function init_schema(PDO $db, string $adminPin): void
+function normalize_email(string $email): string
+{
+    return strtolower(trim($email));
+}
+
+function table_has_column(PDO $db, string $table, string $column): bool
+{
+    $stmt = $db->query('PRAGMA table_info(' . $table . ')');
+    $cols = $stmt ? $stmt->fetchAll() : [];
+    foreach ($cols as $col) {
+        if (strcasecmp((string) ($col['name'] ?? ''), $column) === 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+function ensure_user_columns(PDO $db): void
+{
+    if (!table_has_column($db, 'user', 'email')) {
+        $db->exec('ALTER TABLE user ADD COLUMN email TEXT');
+    }
+    if (!table_has_column($db, 'user', 'name')) {
+        $db->exec('ALTER TABLE user ADD COLUMN name TEXT');
+    }
+    if (!table_has_column($db, 'user', 'auth_type')) {
+        $db->exec("ALTER TABLE user ADD COLUMN auth_type TEXT");
+    }
+}
+
+function find_user_id_by_label(PDO $db, string $label): ?int
+{
+    $labelNorm = normalize_email($label);
+    if ($labelNorm === '') {
+        return null;
+    }
+    $stmt = $db->prepare(
+        "SELECT id FROM user
+         WHERE lower(trim(coalesce(label, ''))) = :label
+         ORDER BY id
+         LIMIT 1"
+    );
+    $stmt->execute([':label' => $labelNorm]);
+    $row = $stmt->fetch();
+    return $row ? (int) $row['id'] : null;
+}
+
+function find_user_id_by_email(PDO $db, string $email): ?int
+{
+    $emailNorm = normalize_email($email);
+    if ($emailNorm === '') {
+        return null;
+    }
+    $stmt = $db->prepare(
+        "SELECT id FROM user
+         WHERE lower(trim(coalesce(email, ''))) = :email
+         ORDER BY id
+         LIMIT 1"
+    );
+    $stmt->execute([':email' => $emailNorm]);
+    $row = $stmt->fetch();
+    return $row ? (int) $row['id'] : null;
+}
+
+function move_viewer_links(PDO $db, int $fromId, int $toId): void
+{
+    if ($fromId === $toId) {
+        return;
+    }
+    $copy = $db->prepare(
+        'INSERT OR IGNORE INTO entry_viewers (entry_id, user_id)
+         SELECT entry_id, :to_id
+         FROM entry_viewers
+         WHERE user_id = :from_id'
+    );
+    $copy->execute([':to_id' => $toId, ':from_id' => $fromId]);
+
+    $delete = $db->prepare('DELETE FROM entry_viewers WHERE user_id = :from_id');
+    $delete->execute([':from_id' => $fromId]);
+}
+
+function upsert_identity_user(PDO $db, string $label, string $email, string $name, int $isEditor): int
+{
+    $desiredEmail = normalize_email($email);
+    $id = find_user_id_by_email($db, $email);
+    if ($id === null) {
+        $id = find_user_id_by_label($db, $label);
+    }
+
+    if ($id === null) {
+        $insert = $db->prepare(
+            'INSERT INTO user (label, pin_hash, is_editor, email, name, auth_type)
+             VALUES (:label, NULL, :is_editor, :email, :name, :auth_type)'
+        );
+        $insert->execute([
+            ':label' => $label,
+            ':is_editor' => $isEditor,
+            ':email' => $desiredEmail,
+            ':name' => $name,
+            ':auth_type' => 'oauth',
+        ]);
+        return (int) $db->lastInsertId();
+    }
+
+    $currentStmt = $db->prepare(
+        'SELECT label, pin_hash, is_editor, email, name, auth_type
+         FROM user
+         WHERE id = :id
+         LIMIT 1'
+    );
+    $currentStmt->execute([':id' => $id]);
+    $current = $currentStmt->fetch() ?: [];
+
+    $needsUpdate =
+        (string) ($current['label'] ?? '') !== $label
+        || (int) ($current['is_editor'] ?? 0) !== $isEditor
+        || normalize_email((string) ($current['email'] ?? '')) !== $desiredEmail
+        || trim((string) ($current['name'] ?? '')) !== $name
+        || normalize_email((string) ($current['auth_type'] ?? '')) !== 'oauth'
+        || (($current['pin_hash'] ?? null) !== null);
+
+    if ($needsUpdate) {
+        $update = $db->prepare(
+            'UPDATE user
+             SET label = :label,
+                 pin_hash = NULL,
+                 is_editor = :is_editor,
+                 email = :email,
+                 name = :name,
+                 auth_type = :auth_type
+             WHERE id = :id'
+        );
+        $update->execute([
+            ':label' => $label,
+            ':is_editor' => $isEditor,
+            ':email' => $desiredEmail,
+            ':name' => $name,
+            ':auth_type' => 'oauth',
+            ':id' => $id,
+        ]);
+    }
+
+    return $id;
+}
+
+function init_schema(PDO $db, string $pinUserLabel, string $pinUserPin, string $adminEmail, string $damianEmail): void
 {
     $db->exec(
         'CREATE TABLE IF NOT EXISTS login_lockout (
@@ -58,19 +209,113 @@ function init_schema(PDO $db, string $adminPin): void
             updated_at TEXT NOT NULL
         )'
     );
+    ensure_user_columns($db);
 
     $guest = $db->query('SELECT id FROM user WHERE id = 0')->fetch();
     if (!$guest) {
-        $stmt = $db->prepare('INSERT INTO user (id, label, pin_hash, is_editor) VALUES (0, :label, NULL, 0)');
-        $stmt->execute([':label' => 'Guest']);
+        $stmt = $db->prepare(
+            'INSERT INTO user (id, label, pin_hash, is_editor, email, name, auth_type)
+             VALUES (0, :label, NULL, 0, NULL, :name, :auth_type)'
+        );
+        $stmt->execute([':label' => 'Guest', ':name' => 'Guest', ':auth_type' => 'guest']);
+    } else {
+        $guestStateStmt = $db->prepare('SELECT label, pin_hash, is_editor, email, name, auth_type FROM user WHERE id = 0 LIMIT 1');
+        $guestStateStmt->execute();
+        $guestState = $guestStateStmt->fetch() ?: [];
+
+        $needsGuestUpdate =
+            (string) ($guestState['label'] ?? '') !== 'Guest'
+            || (($guestState['pin_hash'] ?? null) !== null)
+            || (int) ($guestState['is_editor'] ?? 0) !== 0
+            || trim((string) ($guestState['email'] ?? '')) !== ''
+            || trim((string) ($guestState['name'] ?? '')) !== 'Guest'
+            || normalize_email((string) ($guestState['auth_type'] ?? '')) !== 'guest';
+
+        if ($needsGuestUpdate) {
+            $stmt = $db->prepare(
+                "UPDATE user
+                 SET label = 'Guest',
+                     pin_hash = NULL,
+                     is_editor = 0,
+                     email = NULL,
+                     name = 'Guest',
+                     auth_type = 'guest'
+                 WHERE id = 0"
+            );
+            $stmt->execute();
+        }
     }
 
-    $countStmt = $db->query('SELECT COUNT(*) AS c FROM user WHERE id != 0');
-    $count = (int) $countStmt->fetch()['c'];
-    if ($count === 0) {
-        $hash = hash_pin($adminPin);
-        $stmt = $db->prepare('INSERT INTO user (label, pin_hash, is_editor) VALUES (:label, :pin_hash, 1)');
-        $stmt->execute([':label' => 'Admin', ':pin_hash' => $hash]);
+    $adminId = upsert_identity_user($db, 'Admin', $adminEmail, 'Eric Zeigenbein', 1);
+    $damianId = upsert_identity_user($db, 'Damian', $damianEmail, 'Damian', 0);
+
+    $jId = find_user_id_by_label($db, $pinUserLabel);
+    if ($jId === null) {
+        $insertPinUser = $db->prepare(
+            'INSERT INTO user (label, pin_hash, is_editor, email, name, auth_type)
+             VALUES (:label, :pin_hash, 0, NULL, :name, :auth_type)'
+        );
+        $insertPinUser->execute([
+            ':label' => $pinUserLabel,
+            ':pin_hash' => hash_pin($pinUserPin),
+            ':name' => $pinUserLabel,
+            ':auth_type' => 'pin',
+        ]);
+        $jId = (int) $db->lastInsertId();
+    }
+
+    $existingPinHashStmt = $db->prepare('SELECT pin_hash FROM user WHERE id = :id LIMIT 1');
+    $existingPinHashStmt->execute([':id' => $jId]);
+    $existingPinHash = (string) (($existingPinHashStmt->fetch()['pin_hash'] ?? '') ?: '');
+    $needsPinReset = $existingPinHash === '' || !verify_pin($pinUserPin, $existingPinHash);
+    $pinUserStateStmt = $db->prepare('SELECT label, is_editor, email, name, auth_type FROM user WHERE id = :id LIMIT 1');
+    $pinUserStateStmt->execute([':id' => $jId]);
+    $pinUserState = $pinUserStateStmt->fetch() ?: [];
+    $needsPinUserUpdate =
+        (string) ($pinUserState['label'] ?? '') !== $pinUserLabel
+        || (int) ($pinUserState['is_editor'] ?? 0) !== 0
+        || trim((string) ($pinUserState['email'] ?? '')) !== ''
+        || trim((string) ($pinUserState['name'] ?? '')) !== $pinUserLabel
+        || normalize_email((string) ($pinUserState['auth_type'] ?? '')) !== 'pin';
+
+    if ($needsPinReset || $needsPinUserUpdate) {
+        $updatePinUser = $db->prepare(
+            'UPDATE user
+             SET label = :label,
+                 pin_hash = :pin_hash,
+                 is_editor = 0,
+                 email = NULL,
+                 name = :name,
+                 auth_type = :auth_type
+             WHERE id = :id'
+        );
+        $updatePinUser->execute([
+            ':label' => $pinUserLabel,
+            ':pin_hash' => $needsPinReset ? hash_pin($pinUserPin) : $existingPinHash,
+            ':name' => $pinUserLabel,
+            ':auth_type' => 'pin',
+            ':id' => $jId,
+        ]);
+    }
+
+    // If duplicate legacy identities exist, merge their entry permissions into canonical users.
+    $mergeCandidatesStmt = $db->query('SELECT id, label, email FROM user WHERE id != 0');
+    $mergeCandidates = $mergeCandidatesStmt ? $mergeCandidatesStmt->fetchAll() : [];
+    foreach ($mergeCandidates as $candidate) {
+        $candidateId = (int) $candidate['id'];
+        if ($candidateId === $adminId || $candidateId === $damianId || $candidateId === $jId) {
+            continue;
+        }
+        $labelNorm = normalize_email((string) ($candidate['label'] ?? ''));
+        $emailNorm = normalize_email((string) ($candidate['email'] ?? ''));
+
+        if ($labelNorm === 'admin' || $emailNorm === normalize_email($adminEmail)) {
+            move_viewer_links($db, $candidateId, $adminId);
+        } elseif ($labelNorm === 'damian' || $emailNorm === normalize_email($damianEmail)) {
+            move_viewer_links($db, $candidateId, $damianId);
+        } elseif ($labelNorm === normalize_email($pinUserLabel)) {
+            move_viewer_links($db, $candidateId, $jId);
+        }
     }
 }
 
@@ -90,6 +335,121 @@ function full_path_with_query(): string
 {
     $uri = $_SERVER['REQUEST_URI'] ?? '/';
     return $uri !== '' ? $uri : '/';
+}
+
+function current_request_url(): ?string
+{
+    $host = trim((string) ($_SERVER['HTTP_HOST'] ?? ''));
+    if ($host === '') {
+        return null;
+    }
+
+    $scheme = 'http';
+    $forwardedProto = trim((string) ($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? ''));
+    if ($forwardedProto !== '') {
+        $scheme = trim(explode(',', $forwardedProto)[0]);
+    } elseif (!empty($_SERVER['HTTPS']) && strtolower((string) $_SERVER['HTTPS']) !== 'off') {
+        $scheme = 'https';
+    }
+
+    $uri = $_SERVER['REQUEST_URI'] ?? '/';
+    return sprintf('%s://%s%s', $scheme, $host, $uri);
+}
+
+function absolute_url_for_path(string $path): string
+{
+    if (str_starts_with($path, 'http://') || str_starts_with($path, 'https://')) {
+        return $path;
+    }
+
+    $host = trim((string) ($_SERVER['HTTP_HOST'] ?? ''));
+    if ($host === '') {
+        return $path;
+    }
+
+    $scheme = 'http';
+    $forwardedProto = trim((string) ($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? ''));
+    if ($forwardedProto !== '') {
+        $scheme = trim(explode(',', $forwardedProto)[0]);
+    } elseif (!empty($_SERVER['HTTPS']) && strtolower((string) $_SERVER['HTTPS']) !== 'off') {
+        $scheme = 'https';
+    }
+
+    $normalized = $path === '' ? '/' : $path;
+    if ($normalized[0] !== '/') {
+        $normalized = '/' . $normalized;
+    }
+    return sprintf('%s://%s%s', $scheme, $host, $normalized);
+}
+
+function sanitize_next_path(?string $next): string
+{
+    $value = trim((string) $next);
+    if ($value === '' || $value[0] !== '/' || str_starts_with($value, '//')) {
+        return '/';
+    }
+    return $value;
+}
+
+function build_external_auth_url(string $endpoint, string $nextPath): string
+{
+    $separator = str_contains($endpoint, '?') ? '&' : '?';
+    return $endpoint . $separator . 'next=' . rawurlencode(absolute_url_for_path($nextPath));
+}
+
+function base64url_decode_str(string $value): ?string
+{
+    $base64 = strtr($value, '-_', '+/');
+    $padding = strlen($base64) % 4;
+    if ($padding > 0) {
+        $base64 .= str_repeat('=', 4 - $padding);
+    }
+    $decoded = base64_decode($base64, true);
+    return is_string($decoded) ? $decoded : null;
+}
+
+/**
+ * @return array{name: string, email: string}|null
+ */
+function oauth_identity_from_cookie(string $secret): ?array
+{
+    $cookieValue = trim((string) ($_COOKIE['user'] ?? ''));
+    if ($cookieValue === '') {
+        return null;
+    }
+
+    if ($secret !== '') {
+        $providedSig = trim((string) ($_COOKIE['user_sig'] ?? ''));
+        $expectedSig = hash_hmac('sha256', $cookieValue, $secret);
+        if ($providedSig === '' || !hash_equals($expectedSig, $providedSig)) {
+            return null;
+        }
+    }
+
+    $decoded = base64url_decode_str($cookieValue);
+    if ($decoded === null) {
+        return null;
+    }
+
+    $payload = json_decode($decoded, true);
+    if (!is_array($payload)) {
+        return null;
+    }
+
+    $email = normalize_email((string) ($payload['email'] ?? ''));
+    if ($email === '' || filter_var($email, FILTER_VALIDATE_EMAIL) === false) {
+        return null;
+    }
+
+    $name = trim((string) ($payload['name'] ?? ''));
+    if ($name === '') {
+        $name = $email;
+    }
+
+    return [
+        'name' => $name,
+        'email' => $email,
+    ];
 }
 
 function get_client_ip(): string
@@ -372,6 +732,59 @@ function sanitize_html(string $html): string
     return $output;
 }
 
+/**
+ * @return array{id: int, label: string, pin_hash: ?string, is_editor: int, email: ?string, name: ?string, auth_type: string}|null
+ */
+function fetch_user_by_id(PDO $db, int $id): ?array
+{
+    $stmt = $db->prepare(
+        "SELECT id, label, pin_hash, is_editor, email, name,
+                coalesce(nullif(auth_type, ''),
+                    CASE
+                        WHEN id = 0 THEN 'guest'
+                        WHEN pin_hash IS NOT NULL THEN 'pin'
+                        ELSE 'oauth'
+                    END
+                ) AS auth_type
+         FROM user
+         WHERE id = :id
+         LIMIT 1"
+    );
+    $stmt->execute([':id' => $id]);
+    $row = $stmt->fetch();
+    return $row ?: null;
+}
+
+/**
+ * @return array{id: int, label: string, pin_hash: ?string, is_editor: int, email: ?string, name: ?string, auth_type: string}|null
+ */
+function fetch_oauth_user_by_email(PDO $db, string $email): ?array
+{
+    $emailNorm = normalize_email($email);
+    if ($emailNorm === '') {
+        return null;
+    }
+
+    $stmt = $db->prepare(
+        "SELECT id, label, pin_hash, is_editor, email, name,
+                coalesce(nullif(auth_type, ''),
+                    CASE
+                        WHEN id = 0 THEN 'guest'
+                        WHEN pin_hash IS NOT NULL THEN 'pin'
+                        ELSE 'oauth'
+                    END
+                ) AS auth_type
+         FROM user
+         WHERE lower(trim(coalesce(email, ''))) = :email
+           AND coalesce(nullif(auth_type, ''), CASE WHEN pin_hash IS NOT NULL THEN 'pin' ELSE 'oauth' END) = 'oauth'
+         ORDER BY id
+         LIMIT 1"
+    );
+    $stmt->execute([':email' => $emailNorm]);
+    $row = $stmt->fetch();
+    return $row ?: null;
+}
+
 function require_login(): void
 {
     if (empty($_SESSION['user_id'])) {
@@ -380,24 +793,62 @@ function require_login(): void
     }
 }
 
-function require_editor(array $user): void
+function require_editor(?array $user): void
 {
-    if (empty($user['is_editor'])) {
+    if (!$user || empty($user['is_editor'])) {
         flash('Permission denied');
         redirect_to('/');
     }
 }
 
-function auth_current_user(PDO $db): ?array
+function auth_current_user(PDO $db, ?array $oauthIdentity): ?array
 {
-    if (!isset($_SESSION['user_id'])) {
+    $sessionId = isset($_SESSION['user_id']) ? (int) $_SESSION['user_id'] : null;
+    $sessionMode = (string) ($_SESSION['auth_mode'] ?? '');
+
+    if ($sessionId !== null) {
+        $sessionUser = fetch_user_by_id($db, $sessionId);
+        if ($sessionUser) {
+            $authType = (string) ($sessionUser['auth_type'] ?? '');
+            if ($authType === 'pin' && $sessionMode === 'pin') {
+                return $sessionUser;
+            }
+
+            if ($authType === 'oauth' && $oauthIdentity !== null) {
+                $sessionEmail = normalize_email((string) ($sessionUser['email'] ?? ''));
+                if ($sessionEmail !== '' && strcasecmp($sessionEmail, $oauthIdentity['email']) === 0) {
+                    $_SESSION['auth_mode'] = 'oauth';
+                    if ($oauthIdentity['name'] !== '' && trim((string) ($sessionUser['name'] ?? '')) !== $oauthIdentity['name']) {
+                        $updateName = $db->prepare('UPDATE user SET name = :name WHERE id = :id');
+                        $updateName->execute([':name' => $oauthIdentity['name'], ':id' => (int) $sessionUser['id']]);
+                        $sessionUser['name'] = $oauthIdentity['name'];
+                    }
+                    return $sessionUser;
+                }
+            }
+        }
+
+        unset($_SESSION['user_id'], $_SESSION['auth_mode']);
+    }
+
+    if ($oauthIdentity === null) {
         return null;
     }
 
-    $stmt = $db->prepare('SELECT id, label, pin_hash, is_editor FROM user WHERE id = :id LIMIT 1');
-    $stmt->execute([':id' => (int) $_SESSION['user_id']]);
-    $user = $stmt->fetch();
-    return $user ?: null;
+    $oauthUser = fetch_oauth_user_by_email($db, (string) $oauthIdentity['email']);
+    if (!$oauthUser) {
+        return null;
+    }
+
+    $_SESSION['user_id'] = (int) $oauthUser['id'];
+    $_SESSION['auth_mode'] = 'oauth';
+
+    if ($oauthIdentity['name'] !== '' && trim((string) ($oauthUser['name'] ?? '')) !== $oauthIdentity['name']) {
+        $updateName = $db->prepare('UPDATE user SET name = :name WHERE id = :id');
+        $updateName->execute([':name' => $oauthIdentity['name'], ':id' => (int) $oauthUser['id']]);
+    }
+
+    return fetch_user_by_id($db, (int) $oauthUser['id']) ?: $oauthUser;
 }
 
 function fetch_recent_entries_for_sidebar(PDO $db, ?array $user, int $limit = 10): array
@@ -483,7 +934,7 @@ function layout(string $content, ?array $currentUser, array $recentEntries, stri
             <a href="/logout">Logout (<?= h((string) $currentUser['label']) ?>)</a>
             <?php if ((int) $currentUser['is_editor'] === 1): ?>
                 <a href="/add">New Entry</a>
-                <a href="/manage_pins">Manage Users</a>
+                <a href="/manage_users">Manage Users</a>
                 <a href="/logs">Logs</a>
             <?php endif; ?>
         <?php else: ?>
@@ -516,24 +967,51 @@ function layout(string $content, ?array $currentUser, array $recentEntries, stri
 <?php
 }
 
-function render_login(int $attemptsRemaining, ?string $suggestion, ?array $user, array $recentEntries): void
-{
+function render_login_page(
+    ?array $user,
+    array $recentEntries,
+    string $oauthLoginUrl,
+    string $pinLoginUrl,
+    ?string $unauthorizedEmail
+): void {
     ob_start();
     ?>
 <h2>Login</h2>
+<p class="hint">Use Google sign-in for authorized accounts.</p>
+<?php if ($unauthorizedEmail): ?>
+    <div class="flash">
+        Google account <strong><?= h($unauthorizedEmail) ?></strong> is not authorized for this journal.
+    </div>
+<?php endif; ?>
+<p><a class="button" href="<?= h($oauthLoginUrl) ?>">Continue with Google</a></p>
+<p class="hint">
+    Private fallback account:
+    <a href="<?= h($pinLoginUrl) ?>">Login with PIN</a>
+</p>
+<?php
+    $content = ob_get_clean();
+    layout($content, $user, $recentEntries, 'Login');
+}
+
+function render_pin_login(int $attemptsRemaining, ?string $suggestion, ?array $user, array $recentEntries, string $next): void
+{
+    ob_start();
+    ?>
+<h2>PIN Login</h2>
 <p class="hint">(Try date of birth in MMDDYYYY format)</p>
 <?php if ($suggestion): ?>
     <p class="hint"><?= h($suggestion) ?></p>
 <?php endif; ?>
 <p class="hint">Attempts remaining: <?= $attemptsRemaining ?></p>
-<form method="post" action="/login">
+<form method="post" action="/pin-login?next=<?= urlencode($next) ?>">
     <input type="hidden" name="csrf_token" value="<?= h(csrf_token()) ?>">
     <input type="password" name="pin" placeholder="Enter PIN" required>
     <button type="submit" class="button">Login</button>
 </form>
+<p class="hint"><a href="/login?next=<?= urlencode($next) ?>">Back to Google login</a></p>
 <?php
     $content = ob_get_clean();
-    layout($content, $user, $recentEntries, 'Login');
+    layout($content, $user, $recentEntries, 'PIN Login');
 }
 
 function parse_datetime_or_now(?string $date, ?string $time): string
@@ -549,8 +1027,9 @@ function parse_datetime_or_now(?string $date, ?string $time): string
 }
 
 $db = db_connect($databaseUrl);
-init_schema($db, $adminPin);
-$currentUser = auth_current_user($db);
+init_schema($db, $pinUserLabel, $pinUserPin, $adminEmail, $damianEmail);
+$oauthIdentity = oauth_identity_from_cookie($secureAuthSecret);
+$currentUser = auth_current_user($db, $oauthIdentity);
 $path = rtrim(current_path(), '/');
 $path = $path === '' ? '/' : $path;
 $method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
@@ -606,7 +1085,36 @@ if (preg_match('#^/entry/(\d+)$#', $path, $m)) {
 
 // Route: /login
 if ($path === '/login') {
+    $next = sanitize_next_path((string) ($_GET['next'] ?? '/'));
+    if ($currentUser) {
+        redirect_to($next);
+    }
+
+    $oauthLoginUrl = build_external_auth_url($oauthLoginEndpoint, $next);
+    $pinLoginUrl = '/pin-login?next=' . rawurlencode($next);
+
+    $unauthorizedEmail = null;
+    if ($oauthIdentity !== null) {
+        $oauthUser = fetch_oauth_user_by_email($db, (string) $oauthIdentity['email']);
+        if (!$oauthUser) {
+            $unauthorizedEmail = (string) $oauthIdentity['email'];
+        }
+    }
+
+    render_login_page(
+        $currentUser,
+        fetch_recent_entries_for_sidebar($db, $currentUser),
+        $oauthLoginUrl,
+        $pinLoginUrl,
+        $unauthorizedEmail
+    );
+    exit;
+}
+
+// Route: /pin-login
+if ($path === '/pin-login') {
     $ip = get_client_ip();
+    $next = sanitize_next_path((string) ($_GET['next'] ?? '/'));
 
     $lockStmt = $db->prepare('SELECT failed_attempts, lockout_until FROM login_lockout WHERE ip = :ip LIMIT 1');
     $lockStmt->execute([':ip' => $ip]);
@@ -627,7 +1135,7 @@ if ($path === '/login') {
                 }
                 flash('Too many failed attempts. You are locked out until ' . $until->format('Y-m-d H:i:s') . '.');
                 log_attempt($logPath, $tz, $ip, '(none)', 'lockout (active)');
-                render_login(0, null, $currentUser, fetch_recent_entries_for_sidebar($db, $currentUser));
+                render_pin_login(0, null, $currentUser, fetch_recent_entries_for_sidebar($db, $currentUser), $next);
                 exit;
             }
 
@@ -642,7 +1150,12 @@ if ($path === '/login') {
         require_csrf();
         $pin = (string) ($_POST['pin'] ?? '');
 
-        $users = $db->query('SELECT id, label, pin_hash, is_editor FROM user WHERE pin_hash IS NOT NULL')->fetchAll();
+        $users = $db->query(
+            "SELECT id, label, pin_hash, is_editor
+             FROM user
+             WHERE pin_hash IS NOT NULL
+               AND coalesce(nullif(auth_type, ''), 'pin') = 'pin'"
+        )->fetchAll();
         $matchUser = null;
         foreach ($users as $user) {
             if (verify_pin($pin, $user['pin_hash'])) {
@@ -653,15 +1166,11 @@ if ($path === '/login') {
 
         if ($matchUser) {
             $_SESSION['user_id'] = (int) $matchUser['id'];
+            $_SESSION['auth_mode'] = 'pin';
             $delStmt = $db->prepare('DELETE FROM login_lockout WHERE ip = :ip');
             $delStmt->execute([':ip' => $ip]);
             log_attempt($logPath, $tz, $ip, $pin, 'pass');
-
-            $target = (string) ($_GET['next'] ?? '/');
-            if ($target === '' || $target[0] !== '/') {
-                $target = '/';
-            }
-            redirect_to($target);
+            redirect_to($next);
         }
 
         $failedAttempts = ($lock ? (int) $lock['failed_attempts'] : 0) + 1;
@@ -706,21 +1215,28 @@ if ($path === '/login') {
         }
     }
 
-    render_login($attemptsRemaining, $suggestion, $currentUser, fetch_recent_entries_for_sidebar($db, $currentUser));
+    render_pin_login($attemptsRemaining, $suggestion, $currentUser, fetch_recent_entries_for_sidebar($db, $currentUser), $next);
     exit;
 }
 
 // Route: /logout
 if ($path === '/logout') {
     require_login();
-    unset($_SESSION['user_id']);
-    redirect_to('/');
+    $next = sanitize_next_path((string) ($_GET['next'] ?? '/'));
+    $loggedOutUser = $currentUser;
+
+    unset($_SESSION['user_id'], $_SESSION['auth_mode']);
+
+    if ($loggedOutUser && (string) ($loggedOutUser['auth_type'] ?? '') === 'oauth') {
+        redirect_to(build_external_auth_url($oauthLogoutEndpoint, $next));
+    }
+    redirect_to($next);
 }
 
 // Route: /logs
 if ($path === '/logs') {
     require_login();
-    $currentUser = auth_current_user($db);
+    $currentUser = auth_current_user($db, $oauthIdentity);
     require_editor($currentUser);
 
     $lines = [];
@@ -743,125 +1259,168 @@ if ($path === '/logs') {
     exit;
 }
 
-// Route: /manage_pins
+// Legacy route: /manage_pins
 if ($path === '/manage_pins') {
+    redirect_to('/manage_users');
+}
+
+// Route: /manage_users
+if ($path === '/manage_users') {
     require_login();
-    $currentUser = auth_current_user($db);
+    $currentUser = auth_current_user($db, $oauthIdentity);
     require_editor($currentUser);
 
     if ($method === 'POST') {
         require_csrf();
         $action = (string) ($_POST['action'] ?? '');
-
-        if ($action === 'add') {
-            $label = trim((string) ($_POST['label'] ?? ''));
-            $pin = trim((string) ($_POST['pin'] ?? ''));
-            if ($label === '') {
-                flash('Label is required');
-            } elseif ($pin === '' || !ctype_digit($pin)) {
-                flash('PIN must be numeric');
-            } else {
-                $stmt = $db->prepare('INSERT INTO user (label, pin_hash, is_editor) VALUES (:label, :pin_hash, 0)');
-                $stmt->execute([
-                    ':label' => $label,
-                    ':pin_hash' => hash_pin($pin),
-                ]);
-                flash('PIN added');
-            }
-            redirect_to('/manage_pins');
+        if ($action !== 'edit') {
+            flash('Unknown action');
+            redirect_to('/manage_users');
         }
 
-        if ($action === 'edit') {
-            $userId = (int) ($_POST['user_id'] ?? 0);
-            $label = trim((string) ($_POST['label'] ?? ''));
+        $userId = (int) ($_POST['user_id'] ?? 0);
+        if ($userId === 0) {
+            flash('Cannot edit guest user');
+            redirect_to('/manage_users');
+        }
+
+        $targetUser = fetch_user_by_id($db, $userId);
+        if (!$targetUser) {
+            flash('User not found');
+            redirect_to('/manage_users');
+        }
+
+        $label = trim((string) ($_POST['label'] ?? ''));
+        if ($label === '') {
+            flash('Label is required');
+            redirect_to('/manage_users');
+        }
+
+        $authType = (string) ($targetUser['auth_type'] ?? '');
+        if ($authType === 'pin') {
             $newPin = trim((string) ($_POST['pin'] ?? ''));
-
-            if ($label === '') {
-                flash('Label is required');
-                redirect_to('/manage_pins');
-            }
-
-            $stmt = $db->prepare('SELECT id FROM user WHERE id = :id LIMIT 1');
-            $stmt->execute([':id' => $userId]);
-            $exists = $stmt->fetch();
-            if (!$exists) {
-                flash('User not found');
-                redirect_to('/manage_pins');
-            }
-
             if ($newPin !== '' && !ctype_digit($newPin)) {
                 flash('PIN must be numeric');
-                redirect_to('/manage_pins');
+                redirect_to('/manage_users');
             }
 
             if ($newPin === '') {
-                $update = $db->prepare('UPDATE user SET label = :label WHERE id = :id');
-                $update->execute([':label' => $label, ':id' => $userId]);
+                $update = $db->prepare(
+                    "UPDATE user
+                     SET label = :label,
+                         email = NULL,
+                         auth_type = 'pin',
+                         is_editor = 0
+                     WHERE id = :id"
+                );
+                $update->execute([
+                    ':label' => $label,
+                    ':id' => $userId,
+                ]);
             } else {
-                $update = $db->prepare('UPDATE user SET label = :label, pin_hash = :pin_hash WHERE id = :id');
+                $update = $db->prepare(
+                    "UPDATE user
+                     SET label = :label,
+                         pin_hash = :pin_hash,
+                         email = NULL,
+                         auth_type = 'pin',
+                         is_editor = 0
+                     WHERE id = :id"
+                );
                 $update->execute([
                     ':label' => $label,
                     ':pin_hash' => hash_pin($newPin),
                     ':id' => $userId,
                 ]);
             }
-            flash('PIN updated');
-            redirect_to('/manage_pins');
+            flash('PIN user updated');
+            redirect_to('/manage_users');
         }
 
-        if ($action === 'delete') {
-            $userId = (int) ($_POST['user_id'] ?? 0);
-            if ($userId === 0 || $userId === (int) $currentUser['id']) {
-                flash('Cannot delete this user');
-                redirect_to('/manage_pins');
-            }
+        $email = normalize_email((string) ($_POST['email'] ?? ''));
+        $name = trim((string) ($_POST['name'] ?? ''));
+        $isEditor = !empty($_POST['is_editor']) ? 1 : 0;
 
-            $db->beginTransaction();
-            try {
-                $deleteLinks = $db->prepare('DELETE FROM entry_viewers WHERE user_id = :user_id');
-                $deleteLinks->execute([':user_id' => $userId]);
-                $deleteUser = $db->prepare('DELETE FROM user WHERE id = :id');
-                $deleteUser->execute([':id' => $userId]);
-                $db->commit();
-                flash('PIN deleted');
-            } catch (Throwable $e) {
-                $db->rollBack();
-                flash('Delete failed');
-            }
-            redirect_to('/manage_pins');
+        if ($email === '' || filter_var($email, FILTER_VALIDATE_EMAIL) === false) {
+            flash('A valid email is required for OAuth users');
+            redirect_to('/manage_users');
         }
 
-        flash('Unknown action');
-        redirect_to('/manage_pins');
+        $dupeStmt = $db->prepare(
+            "SELECT id FROM user
+             WHERE id != :id AND lower(trim(coalesce(email, ''))) = :email
+             LIMIT 1"
+        );
+        $dupeStmt->execute([
+            ':id' => $userId,
+            ':email' => $email,
+        ]);
+        if ($dupeStmt->fetch()) {
+            flash('Email is already assigned to another user');
+            redirect_to('/manage_users');
+        }
+
+        $update = $db->prepare(
+            "UPDATE user
+             SET label = :label,
+                 email = :email,
+                 name = :name,
+                 is_editor = :is_editor,
+                 pin_hash = NULL,
+                 auth_type = 'oauth'
+             WHERE id = :id"
+        );
+        $update->execute([
+            ':label' => $label,
+            ':email' => $email,
+            ':name' => $name !== '' ? $name : $label,
+            ':is_editor' => $isEditor,
+            ':id' => $userId,
+        ]);
+        flash('OAuth user updated');
+        redirect_to('/manage_users');
     }
 
-    $pins = $db->query('SELECT id, label FROM user WHERE id != 0 ORDER BY id')->fetchAll();
+    $users = $db->query(
+        "SELECT id, label, email, name, is_editor,
+                coalesce(nullif(auth_type, ''),
+                    CASE
+                        WHEN id = 0 THEN 'guest'
+                        WHEN pin_hash IS NOT NULL THEN 'pin'
+                        ELSE 'oauth'
+                    END
+                ) AS auth_type
+         FROM user
+         WHERE id != 0
+         ORDER BY id"
+    )->fetchAll();
 
     ob_start();
     ?>
 <h2>Manage Users</h2>
+<p class="hint">Google accounts use email-based login. Only one PIN account should remain.</p>
 
-<h3>Add New PIN</h3>
-<form method="post" action="/manage_pins">
-    <input type="hidden" name="csrf_token" value="<?= h(csrf_token()) ?>">
-    <input type="hidden" name="action" value="add">
-    <input type="text" name="label" placeholder="Label" required>
-    <input type="password" name="pin" placeholder="PIN" required>
-    <button type="submit" class="button">Add</button>
-</form>
-
-<h3>Existing Users</h3>
-<?php foreach ($pins as $pin): ?>
-    <form method="post" class="stack-form" action="/manage_pins">
+<?php foreach ($users as $managedUser): ?>
+    <?php $isPinUser = ((string) $managedUser['auth_type']) === 'pin'; ?>
+    <form method="post" class="stack-form" action="/manage_users">
         <input type="hidden" name="csrf_token" value="<?= h(csrf_token()) ?>">
         <input type="hidden" name="action" value="edit">
-        <input type="hidden" name="user_id" value="<?= (int) $pin['id'] ?>">
-        <input type="text" name="label" value="<?= h((string) $pin['label']) ?>" required>
-        <input type="password" name="pin" placeholder="New PIN">
-        <button type="submit" class="button">Update</button>
-        <?php if ((int) $pin['id'] !== (int) $currentUser['id'] && (int) $pin['id'] !== 0): ?>
-            <button type="submit" name="action" value="delete" onclick="return confirm('Delete this user?')" class="button">Delete</button>
+        <input type="hidden" name="user_id" value="<?= (int) $managedUser['id'] ?>">
+        <input type="text" name="label" value="<?= h((string) $managedUser['label']) ?>" required>
+
+        <?php if ($isPinUser): ?>
+            <input type="text" value="PIN account (no Google email)" readonly>
+            <input type="password" name="pin" placeholder="Set new PIN (optional)">
+        <?php else: ?>
+            <input type="email" name="email" value="<?= h((string) ($managedUser['email'] ?? '')) ?>" required>
+            <input type="text" name="name" value="<?= h((string) ($managedUser['name'] ?? '')) ?>" placeholder="Display name">
+            <label>
+                <input type="checkbox" name="is_editor" value="1" <?= (int) $managedUser['is_editor'] === 1 ? 'checked' : '' ?>>
+                Editor
+            </label>
         <?php endif; ?>
+
+        <button type="submit" class="button">Update</button>
     </form>
 <?php endforeach; ?>
 <?php
@@ -873,7 +1432,7 @@ if ($path === '/manage_pins') {
 // Route: /add and /edit/{id}
 if ($path === '/add' || preg_match('#^/edit/(\d+)$#', $path, $m)) {
     require_login();
-    $currentUser = auth_current_user($db);
+    $currentUser = auth_current_user($db, $oauthIdentity);
     require_editor($currentUser);
 
     $editing = $path !== '/add';
@@ -1071,7 +1630,7 @@ document.addEventListener('DOMContentLoaded', function() {
 // Route: /delete/{id}
 if (preg_match('#^/delete/(\d+)$#', $path, $m)) {
     require_login();
-    $currentUser = auth_current_user($db);
+    $currentUser = auth_current_user($db, $oauthIdentity);
     require_editor($currentUser);
 
     if ($method !== 'POST') {
