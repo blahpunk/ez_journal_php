@@ -6,17 +6,20 @@ $databaseUrl = getenv('DATABASE_URL') ?: 'sqlite:////var/lib/ez_journal/journal.
 $secretKey = getenv('SECRET_KEY') ?: 'change-me';
 $pinUserPin = getenv('PIN_USER_PIN') ?: '09111984';
 $logPath = getenv('LOG_PATH') ?: '/var/www/log/journal.log';
-$tz = new DateTimeZone('America/Chicago');
+$appTimeZone = new DateTimeZone('America/Chicago');
+$storageTimeZone = new DateTimeZone('UTC');
 $oauthLoginEndpoint = getenv('OAUTH_LOGIN_URL') ?: 'https://secure.blahpunk.com/oauth_login';
 $oauthLogoutEndpoint = getenv('OAUTH_LOGOUT_URL') ?: 'https://secure.blahpunk.com/logout';
 $secureAuthSecret = trim((string) (getenv('SECURE_AUTH_SECRET') ?: getenv('FLASK_SECRET_KEY') ?: ''));
 $adminEmail = strtolower(trim((string) (getenv('JOURNAL_ADMIN_EMAIL') ?: 'eric.zeigenbein@gmail.com')));
 $damianEmail = strtolower(trim((string) (getenv('JOURNAL_DAMIAN_EMAIL') ?: 'ionru404@gmail.com')));
 $pinUserLabel = trim((string) (getenv('JOURNAL_PIN_LABEL') ?: 'J.'));
+$adminSessionTtlSeconds = max(86400, (int) (getenv('ADMIN_SESSION_TTL_SECONDS') ?: (60 * 60 * 24 * 365 * 10)));
 
 // Secure session cookie settings
 $https = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off')
     || (($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '') === 'https');
+ini_set('session.gc_maxlifetime', (string) $adminSessionTtlSeconds);
 session_set_cookie_params([
     'lifetime' => 0,
     'path' => '/',
@@ -207,6 +210,20 @@ function init_schema(PDO $db, string $pinUserLabel, string $pinUserPin, string $
             failed_attempts INTEGER NOT NULL DEFAULT 0,
             lockout_until TEXT,
             updated_at TEXT NOT NULL
+        )'
+    );
+    $db->exec(
+        'CREATE TABLE IF NOT EXISTS entry_draft (
+            user_id INTEGER NOT NULL,
+            draft_key TEXT NOT NULL,
+            title TEXT NOT NULL DEFAULT \'\',
+            content TEXT NOT NULL DEFAULT \'\',
+            draft_date TEXT NOT NULL DEFAULT \'\',
+            draft_time TEXT NOT NULL DEFAULT \'\',
+            viewer_ids TEXT NOT NULL DEFAULT \'0\',
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (user_id, draft_key),
+            FOREIGN KEY (user_id) REFERENCES user(id) ON DELETE CASCADE
         )'
     );
     ensure_user_columns($db);
@@ -801,7 +818,129 @@ function require_editor(?array $user): void
     }
 }
 
-function auth_current_user(PDO $db, ?array $oauthIdentity): ?array
+function is_admin_user(?array $user, string $adminEmail): bool
+{
+    if (!$user) {
+        return false;
+    }
+    $email = normalize_email((string) ($user['email'] ?? ''));
+    return $email !== '' && $email === normalize_email($adminEmail);
+}
+
+function persist_session_cookie(int $ttlSeconds): void
+{
+    if (session_status() !== PHP_SESSION_ACTIVE) {
+        return;
+    }
+
+    $params = session_get_cookie_params();
+    setcookie(session_name(), session_id(), [
+        'expires' => time() + $ttlSeconds,
+        'path' => $params['path'] ?? '/',
+        'domain' => $params['domain'] ?? '',
+        'secure' => (bool) ($params['secure'] ?? false),
+        'httponly' => (bool) ($params['httponly'] ?? true),
+        'samesite' => $params['samesite'] ?? 'Lax',
+    ]);
+}
+
+function enable_admin_persistent_session(array $user, string $adminEmail, int $ttlSeconds): void
+{
+    if (!is_admin_user($user, $adminEmail)) {
+        return;
+    }
+    $_SESSION['admin_persistent'] = 1;
+    $_SESSION['admin_last_seen'] = time();
+    persist_session_cookie($ttlSeconds);
+}
+
+function fetch_entry_draft(PDO $db, int $userId, string $draftKey): ?array
+{
+    $stmt = $db->prepare(
+        'SELECT title, content, draft_date, draft_time, viewer_ids, updated_at
+         FROM entry_draft
+         WHERE user_id = :user_id AND draft_key = :draft_key
+         LIMIT 1'
+    );
+    $stmt->execute([':user_id' => $userId, ':draft_key' => $draftKey]);
+    $row = $stmt->fetch();
+    return $row ?: null;
+}
+
+function upsert_entry_draft(
+    PDO $db,
+    int $userId,
+    string $draftKey,
+    string $title,
+    string $content,
+    string $draftDate,
+    string $draftTime,
+    string $viewerIds,
+    DateTimeZone $storageTimeZone
+): string {
+    $updatedAt = (new DateTimeImmutable('now', $storageTimeZone))->format(DateTimeInterface::ATOM);
+    $stmt = $db->prepare(
+        'INSERT INTO entry_draft (user_id, draft_key, title, content, draft_date, draft_time, viewer_ids, updated_at)
+         VALUES (:user_id, :draft_key, :title, :content, :draft_date, :draft_time, :viewer_ids, :updated_at)
+         ON CONFLICT(user_id, draft_key) DO UPDATE SET
+            title = excluded.title,
+            content = excluded.content,
+            draft_date = excluded.draft_date,
+            draft_time = excluded.draft_time,
+            viewer_ids = excluded.viewer_ids,
+            updated_at = excluded.updated_at'
+    );
+    $stmt->execute([
+        ':user_id' => $userId,
+        ':draft_key' => $draftKey,
+        ':title' => $title,
+        ':content' => $content,
+        ':draft_date' => $draftDate,
+        ':draft_time' => $draftTime,
+        ':viewer_ids' => $viewerIds,
+        ':updated_at' => $updatedAt,
+    ]);
+    return $updatedAt;
+}
+
+function delete_entry_draft(PDO $db, int $userId, string $draftKey): void
+{
+    $stmt = $db->prepare('DELETE FROM entry_draft WHERE user_id = :user_id AND draft_key = :draft_key');
+    $stmt->execute([':user_id' => $userId, ':draft_key' => $draftKey]);
+}
+
+function normalize_draft_key(string $rawKey): ?string
+{
+    $key = trim($rawKey);
+    if ($key === 'new') {
+        return $key;
+    }
+    if (preg_match('/^edit:\d+$/', $key)) {
+        return $key;
+    }
+    return null;
+}
+
+function parse_storage_datetime(string $raw, DateTimeZone $storageTimeZone): DateTimeImmutable
+{
+    $value = trim($raw);
+    if ($value === '') {
+        return new DateTimeImmutable('now', $storageTimeZone);
+    }
+
+    $dt = DateTimeImmutable::createFromFormat('Y-m-d H:i:s', $value, $storageTimeZone);
+    if ($dt !== false) {
+        return $dt;
+    }
+
+    try {
+        return new DateTimeImmutable($value, $storageTimeZone);
+    } catch (Throwable) {
+        return new DateTimeImmutable('now', $storageTimeZone);
+    }
+}
+
+function auth_current_user(PDO $db, ?array $oauthIdentity, string $adminEmail, int $adminSessionTtlSeconds): ?array
 {
     $sessionId = isset($_SESSION['user_id']) ? (int) $_SESSION['user_id'] : null;
     $sessionMode = (string) ($_SESSION['auth_mode'] ?? '');
@@ -814,21 +953,27 @@ function auth_current_user(PDO $db, ?array $oauthIdentity): ?array
                 return $sessionUser;
             }
 
-            if ($authType === 'oauth' && $oauthIdentity !== null) {
-                $sessionEmail = normalize_email((string) ($sessionUser['email'] ?? ''));
-                if ($sessionEmail !== '' && strcasecmp($sessionEmail, $oauthIdentity['email']) === 0) {
-                    $_SESSION['auth_mode'] = 'oauth';
-                    if ($oauthIdentity['name'] !== '' && trim((string) ($sessionUser['name'] ?? '')) !== $oauthIdentity['name']) {
-                        $updateName = $db->prepare('UPDATE user SET name = :name WHERE id = :id');
-                        $updateName->execute([':name' => $oauthIdentity['name'], ':id' => (int) $sessionUser['id']]);
-                        $sessionUser['name'] = $oauthIdentity['name'];
+            if ($authType === 'oauth') {
+                if ($oauthIdentity !== null) {
+                    $sessionEmail = normalize_email((string) ($sessionUser['email'] ?? ''));
+                    if ($sessionEmail !== '' && strcasecmp($sessionEmail, $oauthIdentity['email']) === 0) {
+                        $_SESSION['auth_mode'] = 'oauth';
+                        if ($oauthIdentity['name'] !== '' && trim((string) ($sessionUser['name'] ?? '')) !== $oauthIdentity['name']) {
+                            $updateName = $db->prepare('UPDATE user SET name = :name WHERE id = :id');
+                            $updateName->execute([':name' => $oauthIdentity['name'], ':id' => (int) $sessionUser['id']]);
+                            $sessionUser['name'] = $oauthIdentity['name'];
+                        }
+                        enable_admin_persistent_session($sessionUser, $adminEmail, $adminSessionTtlSeconds);
+                        return $sessionUser;
                     }
+                } elseif ($sessionMode === 'oauth' && is_admin_user($sessionUser, $adminEmail)) {
+                    enable_admin_persistent_session($sessionUser, $adminEmail, $adminSessionTtlSeconds);
                     return $sessionUser;
                 }
             }
         }
 
-        unset($_SESSION['user_id'], $_SESSION['auth_mode']);
+        unset($_SESSION['user_id'], $_SESSION['auth_mode'], $_SESSION['admin_persistent'], $_SESSION['admin_last_seen']);
     }
 
     if ($oauthIdentity === null) {
@@ -848,7 +993,9 @@ function auth_current_user(PDO $db, ?array $oauthIdentity): ?array
         $updateName->execute([':name' => $oauthIdentity['name'], ':id' => (int) $oauthUser['id']]);
     }
 
-    return fetch_user_by_id($db, (int) $oauthUser['id']) ?: $oauthUser;
+    $resolvedUser = fetch_user_by_id($db, (int) $oauthUser['id']) ?: $oauthUser;
+    enable_admin_persistent_session($resolvedUser, $adminEmail, $adminSessionTtlSeconds);
+    return $resolvedUser;
 }
 
 function fetch_recent_entries_for_sidebar(PDO $db, ?array $user, int $limit = 10): array
@@ -1014,22 +1161,22 @@ function render_pin_login(int $attemptsRemaining, ?string $suggestion, ?array $u
     layout($content, $user, $recentEntries, 'PIN Login');
 }
 
-function parse_datetime_or_now(?string $date, ?string $time): string
+function parse_datetime_or_now(?string $date, ?string $time, DateTimeZone $appTimeZone, DateTimeZone $storageTimeZone): string
 {
     if (!$date || !$time) {
-        return (new DateTimeImmutable())->format('Y-m-d H:i:s');
+        return (new DateTimeImmutable('now', $storageTimeZone))->format('Y-m-d H:i:s');
     }
-    $dt = DateTimeImmutable::createFromFormat('Y-m-d H:i', $date . ' ' . $time);
+    $dt = DateTimeImmutable::createFromFormat('Y-m-d H:i', $date . ' ' . $time, $appTimeZone);
     if (!$dt) {
-        return (new DateTimeImmutable())->format('Y-m-d H:i:s');
+        return (new DateTimeImmutable('now', $storageTimeZone))->format('Y-m-d H:i:s');
     }
-    return $dt->format('Y-m-d H:i:s');
+    return $dt->setTimezone($storageTimeZone)->format('Y-m-d H:i:s');
 }
 
 $db = db_connect($databaseUrl);
 init_schema($db, $pinUserLabel, $pinUserPin, $adminEmail, $damianEmail);
 $oauthIdentity = oauth_identity_from_cookie($secureAuthSecret);
-$currentUser = auth_current_user($db, $oauthIdentity);
+$currentUser = auth_current_user($db, $oauthIdentity, $adminEmail, $adminSessionTtlSeconds);
 $path = rtrim(current_path(), '/');
 $path = $path === '' ? '/' : $path;
 $method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
@@ -1127,14 +1274,14 @@ if ($path === '/pin-login') {
         $failed = (int) $lock['failed_attempts'];
         $attemptsRemaining = max(0, 3 - $failed);
         if (!empty($lock['lockout_until'])) {
-            $now = new DateTimeImmutable('now');
-            $until = new DateTimeImmutable((string) $lock['lockout_until']);
+            $now = new DateTimeImmutable('now', $storageTimeZone);
+            $until = parse_storage_datetime((string) $lock['lockout_until'], $storageTimeZone);
             if ($now < $until) {
                 if ($method === 'POST') {
                     require_csrf();
                 }
-                flash('Too many failed attempts. You are locked out until ' . $until->format('Y-m-d H:i:s') . '.');
-                log_attempt($logPath, $tz, $ip, '(none)', 'lockout (active)');
+                flash('Too many failed attempts. You are locked out until ' . $until->setTimezone($appTimeZone)->format('Y-m-d H:i:s T') . '.');
+                log_attempt($logPath, $appTimeZone, $ip, '(none)', 'lockout (active)');
                 render_pin_login(0, null, $currentUser, fetch_recent_entries_for_sidebar($db, $currentUser), $next);
                 exit;
             }
@@ -1167,9 +1314,10 @@ if ($path === '/pin-login') {
         if ($matchUser) {
             $_SESSION['user_id'] = (int) $matchUser['id'];
             $_SESSION['auth_mode'] = 'pin';
+            unset($_SESSION['admin_persistent'], $_SESSION['admin_last_seen']);
             $delStmt = $db->prepare('DELETE FROM login_lockout WHERE ip = :ip');
             $delStmt->execute([':ip' => $ip]);
-            log_attempt($logPath, $tz, $ip, $pin, 'pass');
+            log_attempt($logPath, $appTimeZone, $ip, $pin, 'pass');
             redirect_to($next);
         }
 
@@ -1177,7 +1325,7 @@ if ($path === '/pin-login') {
         $attemptsRemaining = max(0, 3 - $failedAttempts);
 
         if ($failedAttempts >= 3) {
-            $lockoutUntil = (new DateTimeImmutable('now'))->modify('+1 hour')->format(DateTimeInterface::ATOM);
+            $lockoutUntil = (new DateTimeImmutable('now', $storageTimeZone))->modify('+1 hour')->format(DateTimeInterface::ATOM);
             $upsert = $db->prepare(
                 'INSERT INTO login_lockout (ip, failed_attempts, lockout_until, updated_at)
                  VALUES (:ip, :failed_attempts, :lockout_until, :updated_at)
@@ -1190,10 +1338,10 @@ if ($path === '/pin-login') {
                 ':ip' => $ip,
                 ':failed_attempts' => $failedAttempts,
                 ':lockout_until' => $lockoutUntil,
-                ':updated_at' => (new DateTimeImmutable('now'))->format(DateTimeInterface::ATOM),
+                ':updated_at' => (new DateTimeImmutable('now', $storageTimeZone))->format(DateTimeInterface::ATOM),
             ]);
             flash('Too many failed attempts. You are locked out for 1 hour.');
-            log_attempt($logPath, $tz, $ip, $pin, 'lockout');
+            log_attempt($logPath, $appTimeZone, $ip, $pin, 'lockout');
             $attemptsRemaining = 0;
         } else {
             $upsert = $db->prepare(
@@ -1207,11 +1355,11 @@ if ($path === '/pin-login') {
             $upsert->execute([
                 ':ip' => $ip,
                 ':failed_attempts' => $failedAttempts,
-                ':updated_at' => (new DateTimeImmutable('now'))->format(DateTimeInterface::ATOM),
+                ':updated_at' => (new DateTimeImmutable('now', $storageTimeZone))->format(DateTimeInterface::ATOM),
             ]);
             flash('Invalid PIN. ' . $attemptsRemaining . ' attempt(s) remaining. (Try your date of birth)');
             $suggestion = 'Try your birthdate in MMDDYYYY format';
-            log_attempt($logPath, $tz, $ip, $pin, 'fail');
+            log_attempt($logPath, $appTimeZone, $ip, $pin, 'fail');
         }
     }
 
@@ -1225,7 +1373,7 @@ if ($path === '/logout') {
     $next = sanitize_next_path((string) ($_GET['next'] ?? '/'));
     $loggedOutUser = $currentUser;
 
-    unset($_SESSION['user_id'], $_SESSION['auth_mode']);
+    unset($_SESSION['user_id'], $_SESSION['auth_mode'], $_SESSION['admin_persistent'], $_SESSION['admin_last_seen']);
 
     if ($loggedOutUser && (string) ($loggedOutUser['auth_type'] ?? '') === 'oauth') {
         redirect_to(build_external_auth_url($oauthLogoutEndpoint, $next));
@@ -1236,7 +1384,7 @@ if ($path === '/logout') {
 // Route: /logs
 if ($path === '/logs') {
     require_login();
-    $currentUser = auth_current_user($db, $oauthIdentity);
+    $currentUser = auth_current_user($db, $oauthIdentity, $adminEmail, $adminSessionTtlSeconds);
     require_editor($currentUser);
 
     $lines = [];
@@ -1267,7 +1415,7 @@ if ($path === '/manage_pins') {
 // Route: /manage_users
 if ($path === '/manage_users') {
     require_login();
-    $currentUser = auth_current_user($db, $oauthIdentity);
+    $currentUser = auth_current_user($db, $oauthIdentity, $adminEmail, $adminSessionTtlSeconds);
     require_editor($currentUser);
 
     if ($method === 'POST') {
@@ -1429,14 +1577,84 @@ if ($path === '/manage_users') {
     exit;
 }
 
+// Route: /draft-save
+if ($path === '/draft-save') {
+    require_login();
+    $currentUser = auth_current_user($db, $oauthIdentity, $adminEmail, $adminSessionTtlSeconds);
+    require_editor($currentUser);
+    if ($method !== 'POST') {
+        http_response_code(405);
+        echo 'Method not allowed';
+        exit;
+    }
+    require_csrf();
+
+    $draftKey = normalize_draft_key((string) ($_POST['draft_key'] ?? ''));
+    if ($draftKey === null) {
+        http_response_code(400);
+        echo 'Invalid draft key';
+        exit;
+    }
+
+    $title = trim((string) ($_POST['title'] ?? ''));
+    $content = (string) ($_POST['content'] ?? '');
+    $draftDate = trim((string) ($_POST['date'] ?? ''));
+    $draftTime = trim((string) ($_POST['time'] ?? ''));
+    $viewerIds = trim((string) ($_POST['viewer_ids'] ?? '0'));
+    if ($viewerIds === '') {
+        $viewerIds = '0';
+    }
+
+    $updatedAt = upsert_entry_draft(
+        $db,
+        (int) $currentUser['id'],
+        $draftKey,
+        $title,
+        $content,
+        $draftDate,
+        $draftTime,
+        $viewerIds,
+        $storageTimeZone
+    );
+    header('Content-Type: application/json');
+    echo json_encode(['ok' => true, 'updated_at' => $updatedAt]);
+    exit;
+}
+
+// Route: /draft-discard
+if ($path === '/draft-discard') {
+    require_login();
+    $currentUser = auth_current_user($db, $oauthIdentity, $adminEmail, $adminSessionTtlSeconds);
+    require_editor($currentUser);
+    if ($method !== 'POST') {
+        http_response_code(405);
+        echo 'Method not allowed';
+        exit;
+    }
+    require_csrf();
+
+    $draftKey = normalize_draft_key((string) ($_POST['draft_key'] ?? ''));
+    if ($draftKey === null) {
+        http_response_code(400);
+        echo 'Invalid draft key';
+        exit;
+    }
+
+    delete_entry_draft($db, (int) $currentUser['id'], $draftKey);
+    header('Content-Type: application/json');
+    echo json_encode(['ok' => true]);
+    exit;
+}
+
 // Route: /add and /edit/{id}
 if ($path === '/add' || preg_match('#^/edit/(\d+)$#', $path, $m)) {
     require_login();
-    $currentUser = auth_current_user($db, $oauthIdentity);
+    $currentUser = auth_current_user($db, $oauthIdentity, $adminEmail, $adminSessionTtlSeconds);
     require_editor($currentUser);
 
     $editing = $path !== '/add';
     $entryId = $editing ? (int) $m[1] : null;
+    $draftKey = $editing ? ('edit:' . $entryId) : 'new';
 
     $entry = null;
     $currentViewerIds = [0];
@@ -1465,7 +1683,7 @@ if ($path === '/add' || preg_match('#^/edit/(\d+)$#', $path, $m)) {
         $title = trim((string) ($_POST['title'] ?? ''));
         $rawContent = (string) ($_POST['content'] ?? '');
         $content = sanitize_html($rawContent);
-        $createdAt = parse_datetime_or_now($_POST['date'] ?? null, $_POST['time'] ?? null);
+        $createdAt = parse_datetime_or_now($_POST['date'] ?? null, $_POST['time'] ?? null, $appTimeZone, $storageTimeZone);
         $viewerIdsCsv = (string) ($_POST['viewer_ids'] ?? '0');
         $viewerIds = array_values(array_unique(array_map('intval', array_filter(explode(',', $viewerIdsCsv), 'strlen'))));
         if (!$viewerIds) {
@@ -1506,8 +1724,11 @@ if ($path === '/add' || preg_match('#^/edit/(\d+)$#', $path, $m)) {
             }
 
             $db->commit();
+            delete_entry_draft($db, (int) $currentUser['id'], $draftKey);
         } catch (Throwable $e) {
-            $db->rollBack();
+            if ($db->inTransaction()) {
+                $db->rollBack();
+            }
             flash('Failed to save entry');
             $redir = $editing ? '/edit/' . $entryId : '/add';
             redirect_to($redir);
@@ -1523,22 +1744,61 @@ if ($path === '/add' || preg_match('#^/edit/(\d+)$#', $path, $m)) {
         $userMap[(int) $u['id']] = (string) $u['label'];
     }
 
-    $date = $editing ? (new DateTimeImmutable((string) $entry['created_at']))->format('Y-m-d') : (new DateTimeImmutable())->format('Y-m-d');
-    $time = $editing ? (new DateTimeImmutable((string) $entry['created_at']))->format('H:i') : (new DateTimeImmutable())->format('H:i');
+    $entryDateTime = $editing
+        ? parse_storage_datetime((string) $entry['created_at'], $storageTimeZone)->setTimezone($appTimeZone)
+        : new DateTimeImmutable('now', $appTimeZone);
+    $date = $entryDateTime->format('Y-m-d');
+    $time = $entryDateTime->format('H:i');
     $entryContent = $editing ? (string) $entry['content'] : '';
+    $entryTitle = $editing ? (string) $entry['title'] : '';
+    $draft = fetch_entry_draft($db, (int) $currentUser['id'], $draftKey);
+    $draftUpdatedAt = null;
+    if ($draft) {
+        $entryTitle = (string) ($draft['title'] ?? $entryTitle);
+        $entryContent = (string) ($draft['content'] ?? $entryContent);
+
+        $draftDate = trim((string) ($draft['draft_date'] ?? ''));
+        if ($draftDate !== '' && preg_match('/^\d{4}-\d{2}-\d{2}$/', $draftDate)) {
+            $date = $draftDate;
+        }
+
+        $draftTime = trim((string) ($draft['draft_time'] ?? ''));
+        if ($draftTime !== '' && preg_match('/^\d{2}:\d{2}$/', $draftTime)) {
+            $time = $draftTime;
+        }
+
+        $draftViewerIds = array_values(array_unique(array_map('intval', array_filter(explode(',', (string) ($draft['viewer_ids'] ?? '0')), 'strlen'))));
+        if ($draftViewerIds) {
+            $currentViewerIds = $draftViewerIds;
+        }
+        $rawDraftUpdatedAt = trim((string) ($draft['updated_at'] ?? ''));
+        if ($rawDraftUpdatedAt !== '') {
+            $draftUpdatedAt = parse_storage_datetime($rawDraftUpdatedAt, $storageTimeZone)
+                ->setTimezone($appTimeZone)
+                ->format('Y-m-d H:i:s T');
+        }
+    }
 
     ob_start();
     ?>
 <h2><?= $editing ? 'Edit Entry' : 'New Entry' ?></h2>
 <form method="post" action="<?= $editing ? '/edit/' . $entryId : '/add' ?>">
     <input type="hidden" name="csrf_token" value="<?= h(csrf_token()) ?>">
-    <input type="text" name="title" placeholder="Entry Title" value="<?= h($editing ? (string) $entry['title'] : '') ?>" required>
+    <input type="hidden" name="draft_key" id="draft_key" value="<?= h($draftKey) ?>">
+    <p class="hint" id="draft-status">
+        <?php if ($draftUpdatedAt !== null): ?>
+            Loaded saved draft from <?= h($draftUpdatedAt) ?>. Drafts auto-save every 15 seconds.
+        <?php else: ?>
+            Drafts auto-save every 15 seconds.
+        <?php endif; ?>
+    </p>
+    <input type="text" name="title" id="title" placeholder="Entry Title" value="<?= h($entryTitle) ?>" required>
 
     <label for="date">Date:</label>
-    <input type="date" name="date" value="<?= h($date) ?>" required>
+    <input type="date" name="date" id="date" value="<?= h($date) ?>" required>
 
     <label for="time">Time:</label>
-    <input type="time" name="time" value="<?= h($time) ?>" required>
+    <input type="time" name="time" id="time" value="<?= h($time) ?>" required>
 
     <label for="editor-container">Content:</label>
     <div id="editor-container"></div>
@@ -1564,6 +1824,7 @@ if ($path === '/add' || preg_match('#^/edit/(\d+)$#', $path, $m)) {
     </div>
     <input type="hidden" name="viewer_ids" id="viewer_ids" value="<?= h(implode(',', $currentViewerIds)) ?>">
 
+    <button type="button" class="button" id="discard-draft-btn">Discard Draft</button>
     <button type="submit" class="button">Save</button>
 </form>
 
@@ -1601,6 +1862,12 @@ function removeViewer(button) {
 }
 
 document.addEventListener('DOMContentLoaded', function() {
+    const form = document.querySelector('form');
+    const draftStatus = document.getElementById('draft-status');
+    const csrfToken = form.querySelector('input[name="csrf_token"]').value;
+    const draftKey = document.getElementById('draft_key').value;
+    let lastDraftPayload = '';
+
     const quill = new Quill('#editor-container', {
         theme: 'snow',
         placeholder: 'Write something...',
@@ -1616,8 +1883,76 @@ document.addEventListener('DOMContentLoaded', function() {
         }
     });
     quill.root.innerHTML = <?= json_encode($entryContent, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT) ?>;
-    document.querySelector('form').addEventListener('submit', function() {
+
+    function serializeDraft() {
+        const params = new URLSearchParams();
+        params.set('csrf_token', csrfToken);
+        params.set('draft_key', draftKey);
+        params.set('title', document.getElementById('title').value);
+        params.set('content', quill.root.innerHTML);
+        params.set('date', document.getElementById('date').value);
+        params.set('time', document.getElementById('time').value);
+        params.set('viewer_ids', document.getElementById('viewer_ids').value || '0');
+        return params.toString();
+    }
+
+    async function saveDraft(force) {
+        const payload = serializeDraft();
+        if (!force && payload === lastDraftPayload) {
+            return;
+        }
+        try {
+            const res = await fetch('/draft-save', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' },
+                body: payload
+            });
+            if (!res.ok) {
+                throw new Error('save failed');
+            }
+            lastDraftPayload = payload;
+            draftStatus.textContent = 'Draft saved at ' + new Date().toLocaleTimeString();
+        } catch (err) {
+            draftStatus.textContent = 'Draft save failed. Your current text is still on this page.';
+        }
+    }
+
+    form.addEventListener('submit', function() {
         document.querySelector('#content').value = quill.root.innerHTML;
+        lastDraftPayload = '';
+    });
+
+    setInterval(function() {
+        saveDraft(false);
+    }, 15000);
+
+    quill.on('text-change', function() {
+        draftStatus.textContent = 'Saving draft...';
+    });
+    ['title', 'date', 'time', 'viewer_ids'].forEach(function(id) {
+        document.getElementById(id).addEventListener('input', function() {
+            draftStatus.textContent = 'Saving draft...';
+        });
+        document.getElementById(id).addEventListener('change', function() {
+            draftStatus.textContent = 'Saving draft...';
+        });
+    });
+
+    document.getElementById('discard-draft-btn').addEventListener('click', async function() {
+        const body = new URLSearchParams();
+        body.set('csrf_token', csrfToken);
+        body.set('draft_key', draftKey);
+        const res = await fetch('/draft-discard', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' },
+            body: body.toString()
+        });
+        if (res.ok) {
+            draftStatus.textContent = 'Draft discarded.';
+            lastDraftPayload = '';
+        } else {
+            draftStatus.textContent = 'Could not discard draft.';
+        }
     });
 });
 </script>
@@ -1630,7 +1965,7 @@ document.addEventListener('DOMContentLoaded', function() {
 // Route: /delete/{id}
 if (preg_match('#^/delete/(\d+)$#', $path, $m)) {
     require_login();
-    $currentUser = auth_current_user($db, $oauthIdentity);
+    $currentUser = auth_current_user($db, $oauthIdentity, $adminEmail, $adminSessionTtlSeconds);
     require_editor($currentUser);
 
     if ($method !== 'POST') {
@@ -1650,7 +1985,9 @@ if (preg_match('#^/delete/(\d+)$#', $path, $m)) {
         $delEntry->execute([':id' => $entryId]);
         $db->commit();
     } catch (Throwable $e) {
-        $db->rollBack();
+        if ($db->inTransaction()) {
+            $db->rollBack();
+        }
         flash('Failed to delete entry');
     }
     redirect_to('/');
@@ -1750,7 +2087,7 @@ if ($path === '/') {
     foreach ($entries as $entry):
         $eid = (int) $entry['id'];
         $title = (string) $entry['title'];
-        $dt = new DateTimeImmutable((string) $entry['created_at']);
+        $dt = parse_storage_datetime((string) $entry['created_at'], $storageTimeZone)->setTimezone($appTimeZone);
         $viewerLabels = $viewerMap[$eid] ?? [];
         ?>
     <div class="entry-card" id="entry-<?= $eid ?>">
