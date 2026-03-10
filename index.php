@@ -61,7 +61,7 @@ function load_dotenv_file(string $path): void
 load_dotenv_file(__DIR__ . '/.env');
 
 // Configuration
-$databaseUrl = getenv('DATABASE_URL') ?: 'sqlite:////var/lib/ez_journal/journal.db';
+$databaseUrl = getenv('DATABASE_URL') ?: 'sqlite:///.data/journal.db';
 $secretKey = getenv('SECRET_KEY') ?: 'change-me';
 $pinUserPin = getenv('JOURNAL_FALLBACK_ADMIN_PIN') ?: getenv('PIN_USER_PIN') ?: 'change-me';
 $pinUserIsEditor = filter_var(
@@ -70,7 +70,7 @@ $pinUserIsEditor = filter_var(
     FILTER_NULL_ON_FAILURE
 );
 $pinUserIsEditor = $pinUserIsEditor === null ? true : $pinUserIsEditor;
-$logPath = getenv('LOG_PATH') ?: '/var/www/log/journal.log';
+$logPath = getenv('LOG_PATH') ?: '.logs/journal.log';
 $appTimeZoneName = trim((string) (getenv('JOURNAL_TIMEZONE') ?: getenv('APP_TIMEZONE') ?: 'America/Chicago'));
 try {
     $appTimeZone = new DateTimeZone($appTimeZoneName);
@@ -79,8 +79,8 @@ try {
 }
 $storageTimeZone = new DateTimeZone('UTC');
 date_default_timezone_set($appTimeZone->getName());
-$oauthLoginEndpoint = getenv('OAUTH_LOGIN_URL') ?: 'https://secure.blahpunk.com/oauth_login';
-$oauthLogoutEndpoint = getenv('OAUTH_LOGOUT_URL') ?: 'https://secure.blahpunk.com/logout';
+$oauthLoginEndpoint = getenv('OAUTH_LOGIN_URL') ?: 'https://secure.example.com/oauth_login';
+$oauthLogoutEndpoint = getenv('OAUTH_LOGOUT_URL') ?: 'https://secure.example.com/logout';
 $secureAuthSecret = trim((string) (getenv('SECURE_AUTH_SECRET') ?: getenv('FLASK_SECRET_KEY') ?: ''));
 $secureAuthPreviousSecretsRaw = trim((string) (getenv('SECURE_AUTH_PREVIOUS_SECRETS') ?: ''));
 $secureAuthSecrets = [];
@@ -108,6 +108,16 @@ $secondaryOauthIsEditor = filter_var(
 $secondaryOauthIsEditor = $secondaryOauthIsEditor === null ? false : $secondaryOauthIsEditor;
 $pinUserLabel = trim((string) (getenv('JOURNAL_FALLBACK_ADMIN_LABEL') ?: getenv('JOURNAL_PIN_LABEL') ?: 'Fallback Admin'));
 $adminSessionTtlSeconds = max(86400, (int) (getenv('ADMIN_SESSION_TTL_SECONDS') ?: (60 * 60 * 24 * 365 * 10)));
+$siteTitle = trim((string) (getenv('SITE_TITLE') ?: 'Journal'));
+if ($siteTitle === '') {
+    $siteTitle = 'Journal';
+}
+$homeUrl = trim((string) (getenv('HOME_URL') ?: '/'));
+if ($homeUrl === '') {
+    $homeUrl = '/';
+}
+$matomoBaseUrl = trim((string) (getenv('MATOMO_BASE_URL') ?: ''));
+$matomoSiteId = trim((string) (getenv('MATOMO_SITE_ID') ?: ''));
 
 // Secure session cookie settings
 $https = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off')
@@ -140,7 +150,9 @@ function db_connect(string $databaseUrl): PDO
 
     $dir = dirname($path);
     if (!is_dir($dir)) {
-        throw new RuntimeException('DB directory does not exist: ' . $dir);
+        if (!@mkdir($dir, 0770, true) && !is_dir($dir)) {
+            throw new RuntimeException('DB directory does not exist and could not be created: ' . $dir);
+        }
     }
 
     $pdo = new PDO('sqlite:' . $path);
@@ -1166,8 +1178,9 @@ function fetch_recent_entries_for_sidebar(PDO $db, ?array $user, int $limit = 10
     return $stmt->fetchAll();
 }
 
-function layout(string $content, ?array $currentUser, array $recentEntries, string $title = 'BlahPunk Blog'): void
+function layout(string $content, ?array $currentUser, array $recentEntries, string $title = 'Journal'): void
 {
+    global $siteTitle, $homeUrl, $matomoBaseUrl, $matomoSiteId;
     $flashes = pop_flashes();
     $csrf = csrf_token();
     $styleHref = '/static/styles.css';
@@ -1196,24 +1209,26 @@ function layout(string $content, ?array $currentUser, array $recentEntries, stri
     <link href="https://cdn.jsdelivr.net/npm/quill@2.0.3/dist/quill.snow.css" rel="stylesheet">
     <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;500;700&family=Source+Sans+Pro:wght@400;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="<?= h($styleHref) ?>">
+    <?php if ($matomoBaseUrl !== '' && $matomoSiteId !== ''): ?>
     <script>
       var _paq = window._paq = window._paq || [];
       _paq.push(['trackPageView']);
       _paq.push(['enableLinkTracking']);
       (function() {
-        var u="//anal.blahpunk.com/";
+        var u="<?= h(rtrim($matomoBaseUrl, '/')) ?>/";
         _paq.push(['setTrackerUrl', u+'matomo.php']);
-        _paq.push(['setSiteId', '15']);
+        _paq.push(['setSiteId', '<?= h($matomoSiteId) ?>']);
         var d=document, g=d.createElement('script'), s=d.getElementsByTagName('script')[0];
         g.async=true; g.src=u+'matomo.js'; s.parentNode.insertBefore(g,s);
       })();
     </script>
+    <?php endif; ?>
 </head>
 <body>
 <nav class="navbar">
-    <div class="logo">BlahPunk Blog</div>
+    <div class="logo"><?= h($siteTitle) ?></div>
     <div class="nav-links">
-        <a href="https://blahpunk.com">Home</a>
+        <a href="<?= h($homeUrl) ?>">Home</a>
         <a href="/">Entries</a>
         <?php if ($currentUser): ?>
             <a href="/logout">Logout (<?= h((string) $currentUser['label']) ?>)</a>
@@ -1569,8 +1584,87 @@ if ($path === '/manage_users') {
     if ($method === 'POST') {
         require_csrf();
         $action = (string) ($_POST['action'] ?? '');
-        if ($action !== 'edit') {
+        if ($action !== 'edit' && $action !== 'create_oauth' && $action !== 'create_pin') {
             flash('Unknown action');
+            redirect_to('/manage_users');
+        }
+
+        if ($action === 'create_oauth') {
+            $label = trim((string) ($_POST['label'] ?? ''));
+            $email = normalize_email((string) ($_POST['email'] ?? ''));
+            $name = trim((string) ($_POST['name'] ?? ''));
+            $isEditor = !empty($_POST['is_editor']) ? 1 : 0;
+
+            if ($label === '') {
+                flash('Label is required');
+                redirect_to('/manage_users');
+            }
+            if ($email === '' || filter_var($email, FILTER_VALIDATE_EMAIL) === false) {
+                flash('A valid email is required for OAuth users');
+                redirect_to('/manage_users');
+            }
+
+            $dupeStmt = $db->prepare(
+                "SELECT id FROM user
+                 WHERE lower(trim(coalesce(email, ''))) = :email
+                 LIMIT 1"
+            );
+            $dupeStmt->execute([':email' => $email]);
+            if ($dupeStmt->fetch()) {
+                flash('Email is already assigned to another user');
+                redirect_to('/manage_users');
+            }
+
+            $insert = $db->prepare(
+                "INSERT INTO user (label, pin_hash, is_editor, email, name, auth_type)
+                 VALUES (:label, NULL, :is_editor, :email, :name, 'oauth')"
+            );
+            $insert->execute([
+                ':label' => $label,
+                ':is_editor' => $isEditor,
+                ':email' => $email,
+                ':name' => $name !== '' ? $name : $label,
+            ]);
+
+            flash('OAuth user created');
+            redirect_to('/manage_users');
+        }
+
+        if ($action === 'create_pin') {
+            $label = trim((string) ($_POST['label'] ?? ''));
+            $pin = trim((string) ($_POST['pin'] ?? ''));
+
+            if ($label === '') {
+                flash('Label is required');
+                redirect_to('/manage_users');
+            }
+            if ($pin === '' || !ctype_digit($pin)) {
+                flash('PIN is required and must be numeric');
+                redirect_to('/manage_users');
+            }
+
+            $dupeStmt = $db->prepare(
+                "SELECT id FROM user
+                 WHERE lower(trim(coalesce(label, ''))) = :label
+                 LIMIT 1"
+            );
+            $dupeStmt->execute([':label' => normalize_email($label)]);
+            if ($dupeStmt->fetch()) {
+                flash('Label is already in use');
+                redirect_to('/manage_users');
+            }
+
+            $insert = $db->prepare(
+                "INSERT INTO user (label, pin_hash, is_editor, email, name, auth_type)
+                 VALUES (:label, :pin_hash, 0, NULL, :name, 'pin')"
+            );
+            $insert->execute([
+                ':label' => $label,
+                ':pin_hash' => hash_pin($pin),
+                ':name' => $label,
+            ]);
+
+            flash('PIN user created');
             redirect_to('/manage_users');
         }
 
@@ -1693,32 +1787,142 @@ if ($path === '/manage_users') {
 
     ob_start();
     ?>
-<h2>Manage Users</h2>
-<p class="hint">Google accounts use email-based login. Only one PIN account should remain.</p>
+<div class="manage-users-toolbar">
+    <h2>Manage Users</h2>
+    <button type="button" class="button" id="open-add-user-modal">Add User</button>
+</div>
+<p class="hint manage-users-hint">Add users from the overlay, then edit existing users below.</p>
 
+<div id="add-user-modal" class="modal-overlay" hidden>
+    <div class="modal-card manage-modal-card" role="dialog" aria-modal="true" aria-labelledby="add-user-modal-title">
+        <div class="manage-modal-head">
+            <h3 id="add-user-modal-title">Add User</h3>
+            <button type="button" class="button" id="close-add-user-modal">Close</button>
+        </div>
+        <div class="manage-modal-switch">
+            <button type="button" class="button modal-mode is-active" data-mode="oauth">OAuth User</button>
+            <button type="button" class="button modal-mode" data-mode="pin">PIN User</button>
+        </div>
+
+        <form method="post" class="manage-modal-form" data-mode-panel="oauth" action="/manage_users">
+            <input type="hidden" name="csrf_token" value="<?= h(csrf_token()) ?>">
+            <input type="hidden" name="action" value="create_oauth">
+            <div class="manage-user-fields">
+                <input type="text" name="label" placeholder="Label" required>
+                <input type="email" name="email" placeholder="Email" required>
+                <input type="text" name="name" placeholder="Display name">
+            </div>
+            <div class="manage-user-actions">
+                <label class="editor-toggle">
+                    <input type="checkbox" name="is_editor" value="1">
+                    <span>Editor</span>
+                </label>
+                <button type="submit" class="button">Create OAuth User</button>
+            </div>
+        </form>
+
+        <form method="post" class="manage-modal-form" data-mode-panel="pin" action="/manage_users" hidden>
+            <input type="hidden" name="csrf_token" value="<?= h(csrf_token()) ?>">
+            <input type="hidden" name="action" value="create_pin">
+            <div class="manage-user-fields">
+                <input type="text" name="label" placeholder="Label" required>
+                <input type="password" name="pin" placeholder="Numeric PIN" required>
+            </div>
+            <div class="manage-user-actions">
+                <span class="manage-user-note">PIN users are non-editor by default.</span>
+                <button type="submit" class="button">Create PIN User</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<div class="manage-users-grid">
 <?php foreach ($users as $managedUser): ?>
     <?php $isPinUser = ((string) $managedUser['auth_type']) === 'pin'; ?>
-    <form method="post" class="stack-form" action="/manage_users">
+    <form method="post" class="manage-user-card manage-user-row" action="/manage_users">
         <input type="hidden" name="csrf_token" value="<?= h(csrf_token()) ?>">
         <input type="hidden" name="action" value="edit">
         <input type="hidden" name="user_id" value="<?= (int) $managedUser['id'] ?>">
-        <input type="text" name="label" value="<?= h((string) $managedUser['label']) ?>" required>
 
-        <?php if ($isPinUser): ?>
-            <input type="text" value="PIN account (no Google email)" readonly>
-            <input type="password" name="pin" placeholder="Set new PIN (optional)">
-        <?php else: ?>
-            <input type="email" name="email" value="<?= h((string) ($managedUser['email'] ?? '')) ?>" required>
-            <input type="text" name="name" value="<?= h((string) ($managedUser['name'] ?? '')) ?>" placeholder="Display name">
-            <label>
-                <input type="checkbox" name="is_editor" value="1" <?= (int) $managedUser['is_editor'] === 1 ? 'checked' : '' ?>>
-                Editor
-            </label>
-        <?php endif; ?>
+        <div class="manage-user-head">
+            <strong>#<?= (int) $managedUser['id'] ?></strong>
+            <span class="manage-user-auth"><?= h(strtoupper((string) $managedUser['auth_type'])) ?></span>
+        </div>
 
-        <button type="submit" class="button">Update</button>
+        <div class="manage-user-fields">
+            <input class="manage-user-input manage-user-label" type="text" name="label" value="<?= h((string) $managedUser['label']) ?>" placeholder="Label" required>
+
+            <?php if ($isPinUser): ?>
+                <span class="manage-user-note">PIN-only account</span>
+                <input class="manage-user-input manage-user-pin" type="password" name="pin" placeholder="New PIN (optional)">
+            <?php else: ?>
+                <input class="manage-user-input manage-user-email" type="email" name="email" value="<?= h((string) ($managedUser['email'] ?? '')) ?>" placeholder="Email" required>
+                <input class="manage-user-input manage-user-name" type="text" name="name" value="<?= h((string) ($managedUser['name'] ?? '')) ?>" placeholder="Display name">
+            <?php endif; ?>
+        </div>
+
+        <div class="manage-user-actions">
+            <?php if (!$isPinUser): ?>
+                <label class="editor-toggle">
+                    <input type="checkbox" name="is_editor" value="1" <?= (int) $managedUser['is_editor'] === 1 ? 'checked' : '' ?>>
+                    <span>Editor</span>
+                </label>
+            <?php else: ?>
+                <span class="manage-user-note">Editor role controlled by fallback env settings.</span>
+            <?php endif; ?>
+
+            <button type="submit" class="button">Save</button>
+        </div>
     </form>
 <?php endforeach; ?>
+</div>
+<script>
+(() => {
+  const modal = document.getElementById('add-user-modal');
+  const openBtn = document.getElementById('open-add-user-modal');
+  const closeBtn = document.getElementById('close-add-user-modal');
+  const modeButtons = Array.from(document.querySelectorAll('.modal-mode'));
+  const modePanels = Array.from(document.querySelectorAll('.manage-modal-form'));
+
+  function setMode(mode) {
+    modeButtons.forEach((btn) => {
+      btn.classList.toggle('is-active', btn.getAttribute('data-mode') === mode);
+    });
+    modePanels.forEach((panel) => {
+      panel.hidden = panel.getAttribute('data-mode-panel') !== mode;
+    });
+  }
+
+  function openModal() {
+    if (!modal) return;
+    setMode('oauth');
+    modal.hidden = false;
+    const first = modal.querySelector('input[name=\"label\"]');
+    if (first) first.focus();
+  }
+
+  function closeModal() {
+    if (!modal) return;
+    modal.hidden = true;
+  }
+
+  if (openBtn) openBtn.addEventListener('click', openModal);
+  if (closeBtn) closeBtn.addEventListener('click', closeModal);
+  modeButtons.forEach((btn) => {
+    btn.addEventListener('click', () => setMode(btn.getAttribute('data-mode') || 'oauth'));
+  });
+  if (modal) {
+    modal.addEventListener('click', (e) => {
+      if (e.target === modal) closeModal();
+    });
+  }
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && modal && !modal.hidden) {
+      closeModal();
+    }
+  });
+})();
+</script>
 <?php
     $content = ob_get_clean();
     layout($content, $currentUser, fetch_recent_entries_for_sidebar($db, $currentUser), 'Manage Users');
