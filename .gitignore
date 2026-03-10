@@ -1,0 +1,109 @@
+################################
+# Secrets & environment
+################################
+.env
+.env.*
+*.env
+!.env-sample
+*.key
+*.pem
+*.p12
+*.pfx
+*.crt
+secrets.*
+*.password
+
+################################
+# Logs
+################################
+*.log
+logs/
+
+################################
+# Local runtime data
+################################
+.data/
+.logs/
+*.sqlite
+*.sqlite3
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+
+################################
+# OS files
+################################
+.DS_Store
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*~
+
+################################
+# IDE / Editor
+################################
+.vscode/
+.idea/
+*.swp
+*.swo
+
+################################
+# PHP / Composer
+################################
+vendor/
+.phpunit.result.cache
+
+################################
+# Python
+################################
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+
+################################
+# Node / JavaScript
+################################
+node_modules/
+.npm/
+.yarn/
+.next/
+.nuxt/
+.svelte-kit/
+dist/
+build/
+coverage/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+################################
+# Generic build outputs
+################################
+bin/
+obj/
+out/
+release/
+debug/
+
+################################
+# Test / coverage
+################################
+.coverage
+htmlcov/
+.tox/
+
+################################
+# Terraform / Infra
+################################
+.terraform/
+*.tfstate
+*.tfstate.*
