@@ -79,8 +79,8 @@ try {
 }
 $storageTimeZone = new DateTimeZone('UTC');
 date_default_timezone_set($appTimeZone->getName());
-$oauthLoginEndpoint = getenv('OAUTH_LOGIN_URL') ?: 'https://secure.example.com/oauth_login';
-$oauthLogoutEndpoint = getenv('OAUTH_LOGOUT_URL') ?: 'https://secure.example.com/logout';
+$oauthLoginEndpoint = getenv('OAUTH_LOGIN_URL') ?: 'https://secure.blahpunk.com/oauth_login';
+$oauthLogoutEndpoint = getenv('OAUTH_LOGOUT_URL') ?: 'https://secure.blahpunk.com/logout';
 $secureAuthSecret = trim((string) (getenv('SECURE_AUTH_SECRET') ?: getenv('FLASK_SECRET_KEY') ?: ''));
 $secureAuthPreviousSecretsRaw = trim((string) (getenv('SECURE_AUTH_PREVIOUS_SECRETS') ?: ''));
 $secureAuthSecrets = [];
@@ -97,6 +97,15 @@ if ($secureAuthPreviousSecretsRaw !== '') {
 }
 $secureAuthSecrets = array_values(array_unique($secureAuthSecrets));
 $adminEmail = strtolower(trim((string) (getenv('JOURNAL_ADMIN_EMAIL') ?: 'admin@example.com')));
+$secondaryOauthEmail = strtolower(trim((string) (getenv('JOURNAL_SECONDARY_OAUTH_EMAIL') ?: '')));
+$secondaryOauthLabel = trim((string) (getenv('JOURNAL_SECONDARY_OAUTH_LABEL') ?: ''));
+$secondaryOauthName = trim((string) (getenv('JOURNAL_SECONDARY_OAUTH_NAME') ?: $secondaryOauthLabel));
+$secondaryOauthIsEditor = filter_var(
+    (string) (getenv('JOURNAL_SECONDARY_OAUTH_IS_EDITOR') ?: '0'),
+    FILTER_VALIDATE_BOOLEAN,
+    FILTER_NULL_ON_FAILURE
+);
+$secondaryOauthIsEditor = $secondaryOauthIsEditor === null ? false : $secondaryOauthIsEditor;
 $pinUserLabel = trim((string) (getenv('JOURNAL_FALLBACK_ADMIN_LABEL') ?: getenv('JOURNAL_PIN_LABEL') ?: 'Fallback Admin'));
 $adminSessionTtlSeconds = max(86400, (int) (getenv('ADMIN_SESSION_TTL_SECONDS') ?: (60 * 60 * 24 * 365 * 10)));
 
@@ -291,7 +300,11 @@ function init_schema(
     string $pinUserLabel,
     string $pinUserPin,
     bool $pinUserIsEditor,
-    string $adminEmail
+    string $adminEmail,
+    string $secondaryOauthEmail,
+    string $secondaryOauthLabel,
+    string $secondaryOauthName,
+    bool $secondaryOauthIsEditor
 ): void
 {
     $db->exec(
@@ -354,6 +367,17 @@ function init_schema(
     }
 
     $adminId = upsert_identity_user($db, 'Admin', $adminEmail, 'Eric Zeigenbein', 1);
+    $secondaryOauthId = null;
+    if ($secondaryOauthEmail !== '' && $secondaryOauthLabel !== '') {
+        $secondaryOauthId = upsert_identity_user(
+            $db,
+            $secondaryOauthLabel,
+            $secondaryOauthEmail,
+            $secondaryOauthName !== '' ? $secondaryOauthName : $secondaryOauthLabel,
+            $secondaryOauthIsEditor ? 1 : 0
+        );
+    }
+
     $jId = find_user_id_by_label($db, $pinUserLabel);
     if ($jId === null) {
         $insertPinUser = $db->prepare(
@@ -410,7 +434,7 @@ function init_schema(
     $mergeCandidates = $mergeCandidatesStmt ? $mergeCandidatesStmt->fetchAll() : [];
     foreach ($mergeCandidates as $candidate) {
         $candidateId = (int) $candidate['id'];
-        if ($candidateId === $adminId || $candidateId === $jId) {
+        if ($candidateId === $adminId || $candidateId === $jId || ($secondaryOauthId !== null && $candidateId === $secondaryOauthId)) {
             continue;
         }
         $labelNorm = normalize_email((string) ($candidate['label'] ?? ''));
@@ -418,6 +442,14 @@ function init_schema(
 
         if ($labelNorm === 'admin' || $emailNorm === normalize_email($adminEmail)) {
             move_viewer_links($db, $candidateId, $adminId);
+        } elseif (
+            $secondaryOauthId !== null
+            && (
+                $labelNorm === normalize_email($secondaryOauthLabel)
+                || $emailNorm === normalize_email($secondaryOauthEmail)
+            )
+        ) {
+            move_viewer_links($db, $candidateId, $secondaryOauthId);
         } elseif ($labelNorm === normalize_email($pinUserLabel)) {
             move_viewer_links($db, $candidateId, $jId);
         }
@@ -1280,7 +1312,17 @@ function parse_datetime_or_now(?string $date, ?string $time, DateTimeZone $appTi
 }
 
 $db = db_connect($databaseUrl);
-init_schema($db, $pinUserLabel, $pinUserPin, $pinUserIsEditor, $adminEmail);
+init_schema(
+    $db,
+    $pinUserLabel,
+    $pinUserPin,
+    $pinUserIsEditor,
+    $adminEmail,
+    $secondaryOauthEmail,
+    $secondaryOauthLabel,
+    $secondaryOauthName,
+    $secondaryOauthIsEditor
+);
 $oauthIdentity = oauth_identity_from_cookie($secureAuthSecrets);
 $currentUser = auth_current_user($db, $oauthIdentity, $adminEmail, $adminSessionTtlSeconds);
 $path = rtrim(current_path(), '/');
